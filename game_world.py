@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Motor lógico de simulación de obra, físicas de colisión con los modelos de FreeCAD
-(Casas de Barbosa y Doradal), gestión de materiales (ladrillos, bloques, bultos de cemento,
-mezcla de concreto, carretillas, concretadora) e Inteligencia Artificial de los 3 ayudantes.
+Motor lógico de simulación de obra y exploración arquitectónica, físicas de colisión 3D
+con los modelos de FreeCAD (Vivienda Tipo 1 y Vivienda Tipo 2), subida por escaleras,
+gestión de materiales (ladrillos, bloques, bultos de cemento, mezcla de concreto,
+carretillas, concretadora) e Inteligencia Artificial de los 3 ayudantes.
 """
 
 import os
@@ -16,6 +17,13 @@ ITEM_NAMES = {
     "bloque": "Bloque de Concreto",
     "bulto_cemento": "Bulto de Cemento (50kg)",
     "mezcla": "Mezcla de Concreto",
+}
+
+HOUSE_ALIASES = {
+    "barbosa": "tipo1",
+    "doradal": "tipo2",
+    "tipo1": "tipo1",
+    "tipo2": "tipo2",
 }
 
 
@@ -62,7 +70,6 @@ class ConcreteMixer:
             if self.shovels_available == 0:
                 self.mix_progress = 0.0
             return True
-        # Incluso si está mezclando, permitir sacar mezcla húmeda
         return True
 
 
@@ -128,7 +135,7 @@ class NPCWorker:
     Personajes ayudantes de obra con comportamiento cooperativo autónomo y por órdenes:
     - 'palero' (Don Chucho): Llena con la pala la carretilla que sostiene el Jugador o Jairo, y alimenta la concretadora.
     - 'carretillero' (Jairo): Sostiene la carretilla mientras el Jugador o Don Chucho la llenan con pala, y la lleva adentro de la casa.
-    - 'auxiliar' (Mateo): Transporta ladrillos, bloques y bultos de cemento desde el patio hacia el interior de la casa o a la carretilla.
+    - 'auxiliar' (Mateo): Transporta ladrillos, bloques y bultos de cemento desde el patio hacia el interior (incluyendo el 2do piso por escalera).
     """
     def __init__(self, npc_id, name, role, x, y, z, helmet_color, vest_color, shirt_color):
         self.id = npc_id
@@ -152,7 +159,7 @@ class NPCWorker:
         self.shovel_timer = 0.0
         self.target_zone_idx = 0
 
-    def move_towards(self, tx, ty, speed, dt, world, ignore_walls=False):
+    def move_towards(self, tx, ty, speed, dt, world, ignore_walls=False, tz=None):
         dx = tx - self.x
         dy = ty - self.y
         dist = math.hypot(dx, dy)
@@ -165,25 +172,24 @@ class NPCWorker:
         ny = self.y + (dy / dist) * step
 
         if not ignore_walls:
-            nx, ny = world.resolve_collision(self.x, self.y, nx, ny, radius=0.24)
-            # Si hay obstáculo directo, rodear ligeramente hacia la puerta más cercana
+            nx, ny = world.resolve_collision(self.x, self.y, nx, ny, radius=0.24, cur_z=self.z)
             if math.hypot(nx - self.x, ny - self.y) < step * 0.25:
-                door_x, door_y = world.get_nearest_entry_point(self.x, self.y, tx, ty)
+                door_x, door_y = world.get_nearest_entry_point(self.x, self.y, self.z, tx, ty, tz)
                 ddx, ddy = door_x - self.x, door_y - self.y
                 ddist = math.hypot(ddx, ddy)
                 if ddist > 0.1:
                     self.yaw = math.degrees(math.atan2(ddy, ddx))
                     nx = self.x + (ddx / ddist) * step
                     ny = self.y + (ddy / ddist) * step
-                    nx, ny = world.resolve_collision(self.x, self.y, nx, ny, radius=0.22)
+                    nx, ny = world.resolve_collision(self.x, self.y, nx, ny, radius=0.22, cur_z=self.z)
 
         self.x, self.y = nx, ny
-        self.z = world.get_floor_height(self.x, self.y)
+        self.z = world.get_floor_height(self.x, self.y, cur_z=self.z)
         self.anim_phase += dt * 1.4
         return dist < 0.35
 
     def update(self, dt, world):
-        self.z = world.get_floor_height(self.x, self.y)
+        self.z = world.get_floor_height(self.x, self.y, cur_z=self.z)
         mixer = world.mixer
         player = world.player
 
@@ -192,7 +198,6 @@ class NPCWorker:
         # ------------------------------------------------------------------
         if self.role == "palero":
             self.has_shovel = True
-            # Buscar si el jugador o el carretillero tienen una carretilla cerca de la concretadora esperando ser llenada
             target_wb = None
             if player["held_wheelbarrow"] is not None:
                 wb = player["held_wheelbarrow"]
@@ -201,8 +206,6 @@ class NPCWorker:
                         target_wb = wb
 
             if target_wb is None:
-                # Revisar si Jairo (carretillero) está sosteniendo una carretilla frente a la concretadora
-                # pero solo si el modo NO es "hold_for_player" (donde Jairo espera que el jugador palee)
                 for other in world.npcs:
                     if other.role == "carretillero" and other.held_wheelbarrow is not None:
                         wb = other.held_wheelbarrow
@@ -212,7 +215,6 @@ class NPCWorker:
                                 break
 
             if target_wb is not None:
-                # Ir al costado entre la concretadora y la carretilla y llenarla con la pala
                 work_x = (mixer.x + target_wb.x) * 0.5 - 0.55
                 work_y = (mixer.y + target_wb.y) * 0.5
                 reached = self.move_towards(work_x, work_y, speed=2.4, dt=dt, world=world)
@@ -239,7 +241,6 @@ class NPCWorker:
                             if world.crew_command == "fill_player_wb":
                                 world.crew_command = "auto"
             else:
-                # Mantenerse operando la concretadora y paleando arena al trompo
                 stand_x = mixer.x - 0.85
                 stand_y = mixer.y + 0.65
                 if not self.move_towards(stand_x, stand_y, speed=2.1, dt=dt, world=world):
@@ -257,7 +258,6 @@ class NPCWorker:
         # ROL 2: JAIRO (Ayudante Carretillero - Sostiene carretilla y transporta)
         # ------------------------------------------------------------------
         elif self.role == "carretillero":
-            # Si no tiene carretilla, buscar una carretilla libre
             if self.held_wheelbarrow is None:
                 free_wb = None
                 for wb in world.wheelbarrows:
@@ -281,8 +281,6 @@ class NPCWorker:
                     self.held_wheelbarrow = None
                     return
 
-                # Si la carretilla aún NO está llena, Jairo la posiciona frente a la concretadora y LA SOSTIENE
-                # para que el Jugador (con su pala) o Don Chucho la llenen
                 if not wb.is_full():
                     hold_x = mixer.x + 0.15
                     hold_y = mixer.y + 1.55
@@ -290,7 +288,6 @@ class NPCWorker:
                         self.anim_state = "hold_wheelbarrow"
                         self.status_text = "Posicionando carretilla en concretadora"
                     else:
-                        # Mirar hacia la concretadora sosteniendo firmemente los mangos
                         self.yaw = -90.0
                         self.anim_state = "hold_wheelbarrow"
                         self.anim_phase = 0.0
@@ -299,20 +296,20 @@ class NPCWorker:
                         else:
                             self.status_text = f"Sosteniendo carretilla mientras palean ({wb.concrete_level}/3)"
                 else:
-                    # ¡Carretilla llena! Jairo la lleva dentro de la casa a la zona de obra activa
-                    zone = world.work_zones[self.target_zone_idx % len(world.work_zones)]
-                    zx, zy, _ = zone["pos"]
-                    if not self.move_towards(zx, zy - 0.85, speed=2.3, dt=dt, world=world):
+                    # Jairo entrega en zonas de planta baja / primer piso (sin subir escalera con carretilla)
+                    p1_zones = [z for z in world.work_zones if z["pos"][2] < 2.2] or world.work_zones
+                    zone = p1_zones[self.target_zone_idx % len(p1_zones)]
+                    zx, zy, zz = zone["pos"]
+                    if not self.move_towards(zx, zy - 0.85, speed=2.3, dt=dt, world=world, tz=zz):
                         self.anim_state = "hold_wheelbarrow"
                         self.status_text = f"Llevando carretilla llena a {zone['name']}"
                     else:
                         delivered = wb.dump_all()
                         zone["delivered"] += delivered
                         world.total_delivered += delivered
-                        self.target_zone_idx = (self.target_zone_idx + 1) % len(world.work_zones)
+                        self.target_zone_idx = (self.target_zone_idx + 1) % len(p1_zones)
                         world.set_toast(f"Jairo descargó la carretilla en {zone['name']} (+{delivered} mezcla)")
 
-                # Actualizar posición de la carretilla frente a Jairo
                 rad = math.radians(self.yaw)
                 wb.x = self.x + math.cos(rad) * 0.72
                 wb.y = self.y + math.sin(rad) * 0.72
@@ -326,7 +323,7 @@ class NPCWorker:
             if world.crew_command == "follow_player":
                 dist_p = math.hypot(player["x"] - self.x, player["y"] - self.y)
                 if dist_p > 1.8:
-                    self.move_towards(player["x"] - 0.8, player["y"] - 0.8, speed=2.6, dt=dt, world=world)
+                    self.move_towards(player["x"] - 0.8, player["y"] - 0.8, speed=2.6, dt=dt, world=world, tz=player["z"])
                     self.anim_state = "carry" if self.carrying_item else "walk"
                     self.status_text = "Siguiendo al Ingeniero"
                 else:
@@ -335,26 +332,25 @@ class NPCWorker:
                 return
 
             if self.carrying_item is None:
-                # Elegir alternadamente entre ladrillo, bloque y bulto_cemento
                 stations = [s for s in world.stations if s["item_type"] in ("ladrillo", "bloque", "bulto_cemento")]
                 st = stations[self.target_zone_idx % len(stations)]
-                sx, sy, _ = st["pos"]
-                if not self.move_towards(sx, sy + 0.75, speed=2.5, dt=dt, world=world):
+                sx, sy, sz = st["pos"]
+                if not self.move_towards(sx, sy + 0.75, speed=2.5, dt=dt, world=world, tz=sz):
                     self.anim_state = "walk"
                     self.status_text = f"Yendo por {ITEM_NAMES[st['item_type']]}"
                 else:
                     self.carrying_item = st["item_type"]
                     self.status_text = f"Cargando {ITEM_NAMES[self.carrying_item]}"
             else:
-                # Si el jugador sostiene una carretilla cerca en el patio y tiene espacio para unidades, cargársela
                 if (
                     player["held_wheelbarrow"] is not None
                     and player["held_wheelbarrow"].concrete_level == 0
                     and not player["held_wheelbarrow"].is_full()
                     and math.hypot(player["x"] - self.x, player["y"] - self.y) < 3.5
+                    and abs(player["z"] - self.z) < 0.8
                 ):
                     wb = player["held_wheelbarrow"]
-                    if not self.move_towards(wb.x, wb.y, speed=2.5, dt=dt, world=world):
+                    if not self.move_towards(wb.x, wb.y, speed=2.5, dt=dt, world=world, tz=wb.z):
                         self.anim_state = "carry"
                         self.status_text = f"Llevando {ITEM_NAMES[self.carrying_item]} a tu carretilla"
                     else:
@@ -364,10 +360,9 @@ class NPCWorker:
                             self.target_zone_idx += 1
                             return
 
-                # De lo contrario, transportar el elemento al interior de la casa
                 zone = world.work_zones[self.target_zone_idx % len(world.work_zones)]
-                zx, zy, _ = zone["pos"]
-                if not self.move_towards(zx, zy, speed=2.4, dt=dt, world=world):
+                zx, zy, zz = zone["pos"]
+                if not self.move_towards(zx, zy, speed=2.4, dt=dt, world=world, tz=zz):
                     self.anim_state = "carry"
                     self.status_text = f"Transportando {ITEM_NAMES[self.carrying_item]} a {zone['name']}"
                 else:
@@ -378,13 +373,19 @@ class NPCWorker:
 
 
 class ConstructionWorld:
-    def __init__(self, assets_dir):
+    def __init__(self, assets_dir, initial_house="tipo1", initial_mode="obra"):
         self.assets_dir = assets_dir
-        self.current_house_key = "barbosa"
+        self.current_house_key = "tipo1"
         self.house_title = ""
         self.meta = {}
         self.meshes = {}
         self.floor_z = 1.32
+        self.stairs_steps = []
+        self.walkable_slabs = []
+        self.stair_bounds = None
+
+        # Modo de simulación: 'obra' (con cuadrilla, carretilla y pala) o 'exploracion' (solo observar)
+        self.mode = initial_mode if initial_mode in ("obra", "exploracion") else "obra"
 
         # Visibilidad de capas arquitectónicas/estructurales
         self.show_roof = True
@@ -394,10 +395,12 @@ class ConstructionWorld:
 
         # Estado del jugador
         self.player = {
-            "x": 3.5,
+            "x": 3.8,
             "y": -2.2,
             "z": 1.32,
-            "yaw": 90.0,       # 90° mira hacia +Y (hacia el interior de la casa)
+            "smooth_z": 1.32,
+            "vz": 0.0,
+            "yaw": 90.0,
             "pitch": -14.0,
             "speed": 3.8,
             "carrying_item": None,
@@ -421,16 +424,39 @@ class ConstructionWorld:
         self.npcs = []
         self.particles = []
 
-        self.crew_command = "auto"  # 'auto', 'hold_for_player', 'fill_player_wb', 'follow_player'
+        self.crew_command = "auto"
         self.total_delivered = 0
-        self.toast_message = "¡Bienvenido a la Obra! Usa WASD para moverte y E para interactuar."
+        self.toast_message = "¡Bienvenido! Usa WASD para moverte, [M] para Modo Exploración."
         self.toast_timer = 6.0
 
-        self.load_house("barbosa")
+        self.load_house(initial_house)
 
     def set_toast(self, msg, duration=4.5):
         self.toast_message = msg
         self.toast_timer = duration
+
+    def set_mode(self, mode):
+        if mode not in ("obra", "exploracion"):
+            return
+        self.mode = mode
+        p = self.player
+        if mode == "exploracion":
+            if p["held_wheelbarrow"] is not None:
+                p["held_wheelbarrow"].holder = None
+                p["held_wheelbarrow"] = None
+            p["carrying_item"] = None
+            p["has_shovel"] = False
+            p["shovel_loaded"] = False
+            p["shovel_anim_timer"] = 0.0
+            self.set_toast(
+                "Modo Exploración activo: recorre y observa la vivienda libremente (sin carretilla ni pala)."
+            )
+        else:
+            self.set_toast("Modo Obra activo: interactúa con carretillas [E], pala [F] y cuadrilla [1-4].")
+
+    def toggle_mode(self):
+        next_mode = "exploracion" if self.mode == "obra" else "obra"
+        self.set_mode(next_mode)
 
     def spawn_shovel_particles(self, x, y, z):
         for i in range(10):
@@ -446,6 +472,7 @@ class ConstructionWorld:
             })
 
     def load_house(self, house_key):
+        house_key = HOUSE_ALIASES.get(house_key, "tipo1")
         self.current_house_key = house_key
         npz_path = os.path.join(self.assets_dir, f"{house_key}_scene.npz")
         meta_path = os.path.join(self.assets_dir, f"{house_key}_meta.json")
@@ -455,19 +482,30 @@ class ConstructionWorld:
         npz_data = np.load(npz_path)
         self.meshes = {k: npz_data[k] for k in npz_data.files}
         self.floor_z = float(self.meta["floor_z"])
+        self.stairs_steps = self.meta.get("stairs_steps", [])
+        self.walkable_slabs = self.meta.get("walkable_slabs", [])
+
+        if self.stairs_steps:
+            xs0 = [s["box"][0] for s in self.stairs_steps]
+            xs1 = [s["box"][1] for s in self.stairs_steps]
+            ys0 = [s["box"][2] for s in self.stairs_steps]
+            ys1 = [s["box"][3] for s in self.stairs_steps]
+            zs1 = [s["z_top"] for s in self.stairs_steps]
+            self.stair_bounds = (min(xs0), max(xs1), min(ys0), max(ys1), max(zs1))
+        else:
+            self.stair_bounds = None
 
         self.loose_items.clear()
         self.particles.clear()
 
-        if house_key == "barbosa":
-            self.house_title = "Casa Barbosa (Estructura Metálica y Mampostería en Ladera)"
+        if house_key == "tipo1":
+            self.house_title = "Vivienda Tipo 1 — Estructura Metálica en Ladera"
             fz = self.floor_z  # 1.32 m
             self.player.update({
-                "x": 3.8, "y": -2.0, "z": fz, "yaw": 90.0,
+                "x": 3.8, "y": -2.2, "z": fz, "smooth_z": fz, "vz": 0.0, "yaw": 90.0,
                 "carrying_item": None, "held_wheelbarrow": None,
-                "has_shovel": False, "shovel_loaded": False,
+                "has_shovel": False, "shovel_loaded": False, "shovel_anim_timer": 0.0,
             })
-            # Concretadora y acopios en la plazoleta frontal de obra (Y = -5.5 a 0.0 m)
             self.mixer = ConcreteMixer(x=2.0, y=-3.4, z=fz, yaw=0.0)
             self.stations = [
                 {"name": "Pila de Arena, Grava y Agua", "item_type": "arena", "pos": (0.2, -3.5, fz), "stock": 99},
@@ -479,20 +517,17 @@ class ConstructionWorld:
                 Wheelbarrow(1, x=2.15, y=-1.85, z=fz, yaw=-90.0),
                 Wheelbarrow(2, x=4.20, y=-1.75, z=fz, yaw=90.0),
             ]
-            # Elementos sueltos dentro y fuera de la casa para recoger y mover libremente
             self.loose_items = [
                 {"type": "ladrillo", "x": 3.6, "y": 1.4, "z": fz, "yaw": 15.0},
                 {"type": "ladrillo", "x": 3.9, "y": 1.5, "z": fz, "yaw": -20.0},
                 {"type": "bloque", "x": 2.2, "y": 2.2, "z": fz, "yaw": 0.0},
                 {"type": "bulto_cemento", "x": 4.8, "y": 1.8, "z": fz, "yaw": 45.0},
             ]
-            # Zonas de trabajo en el interior de la Casa de Barbosa
             self.work_zones = [
                 {"name": "Sala Principal (Acceso)", "pos": (4.4, 2.1, fz), "delivered": 0, "target": 10},
                 {"name": "Habitación Central", "pos": (2.2, 5.2, fz), "delivered": 0, "target": 10},
                 {"name": "Balcón / Terraza Mirador", "pos": (4.2, 11.8, fz), "delivered": 0, "target": 10},
             ]
-            # Cuadrilla de 3 obreros ayudantes
             self.npcs = [
                 NPCWorker(1, "Don Chucho (Palero)", "palero", 1.1, -2.8, fz,
                           helmet_color=(0.95, 0.82, 0.10), vest_color=(0.92, 0.48, 0.10), shirt_color=(0.16, 0.34, 0.62)),
@@ -503,62 +538,123 @@ class ConstructionWorld:
             ]
 
         else:
-            self.house_title = "Casa Doradal (Pórticos de Concreto Reforzado, Locales y Apartamento)"
-            fz = self.floor_z  # 0.10 m
+            self.house_title = "Vivienda Tipo 2 — Aporticada + Ampliación (2 Pisos con Escalera)"
+            fz = self.floor_z  # 0.10 m en losa Piso 1, 0.00 m en terreno/acceso escalera
             self.player.update({
-                "x": 7.5, "y": -2.2, "z": fz, "yaw": 90.0,
+                "x": 14.2, "y": -2.6, "z": 0.0, "smooth_z": 0.0, "vz": 0.0, "yaw": 90.0,
                 "carrying_item": None, "held_wheelbarrow": None,
-                "has_shovel": False, "shovel_loaded": False,
+                "has_shovel": False, "shovel_loaded": False, "shovel_anim_timer": 0.0,
             })
-            self.mixer = ConcreteMixer(x=8.2, y=-3.4, z=fz, yaw=0.0)
+            self.mixer = ConcreteMixer(x=14.2, y=-3.7, z=0.0, yaw=0.0)
             self.stations = [
-                {"name": "Pila de Arena, Grava y Agua", "item_type": "arena", "pos": (6.2, -3.5, fz), "stock": 99},
-                {"name": "Estiba de Ladrillos Tolete", "item_type": "ladrillo", "pos": (2.6, -2.2, fz), "stock": 16},
-                {"name": "Estiba de Bloques #4", "item_type": "bloque", "pos": (11.2, -2.2, fz), "stock": 16},
-                {"name": "Estiba de Bultos de Cemento", "item_type": "bulto_cemento", "pos": (14.2, -2.6, fz), "stock": 16},
+                {"name": "Pila de Arena, Grava y Agua", "item_type": "arena", "pos": (12.2, -3.7, 0.0), "stock": 99},
+                {"name": "Estiba de Ladrillos Tolete", "item_type": "ladrillo", "pos": (10.5, -2.0, 0.0), "stock": 16},
+                {"name": "Estiba de Bloques #4", "item_type": "bloque", "pos": (16.8, -2.0, 0.0), "stock": 16},
+                {"name": "Estiba de Bultos de Cemento", "item_type": "bulto_cemento", "pos": (18.4, -3.5, 0.0), "stock": 16},
             ]
             self.wheelbarrows = [
-                Wheelbarrow(1, x=8.35, y=-1.85, z=fz, yaw=-90.0),
-                Wheelbarrow(2, x=4.50, y=-1.80, z=fz, yaw=90.0),
+                Wheelbarrow(1, x=14.35, y=-2.05, z=0.0, yaw=-90.0),
+                Wheelbarrow(2, x=12.50, y=-1.95, z=0.0, yaw=90.0),
             ]
             self.loose_items = [
-                {"type": "ladrillo", "x": 2.6, "y": 2.0, "z": fz, "yaw": 10.0},
-                {"type": "bloque", "x": 7.2, "y": 2.4, "z": fz, "yaw": -15.0},
-                {"type": "bulto_cemento", "x": 13.4, "y": 2.0, "z": fz, "yaw": 30.0},
+                {"type": "ladrillo", "x": 13.5, "y": 1.8, "z": fz, "yaw": 10.0},
+                {"type": "bloque", "x": 16.7, "y": 3.0, "z": 0.0, "yaw": -15.0},
+                {"type": "bulto_cemento", "x": 15.0, "y": 6.2, "z": fz, "yaw": 30.0},
             ]
             self.work_zones = [
-                {"name": "Módulo 1 (Zona Montallantas)", "pos": (2.5, 4.2, fz), "delivered": 0, "target": 10},
-                {"name": "Módulo 2 (Salón Central)", "pos": (7.2, 5.5, fz), "delivered": 0, "target": 10},
-                {"name": "Módulo 3 (Restaurante y Apto)", "pos": (14.0, 3.8, fz), "delivered": 0, "target": 10},
+                {"name": "Local / Restaurante (Piso 1)", "pos": (14.2, 3.0, fz), "delivered": 0, "target": 10},
+                {"name": "Apartamento (Piso 1)", "pos": (14.2, 7.2, fz), "delivered": 0, "target": 10},
+                {"name": "Ampliación / Terraza (Piso 2)", "pos": (15.2, 12.2, 3.20), "delivered": 0, "target": 10},
             ]
             self.npcs = [
-                NPCWorker(1, "Don Chucho (Palero)", "palero", 7.3, -2.8, fz,
+                NPCWorker(1, "Don Chucho (Palero)", "palero", 13.3, -3.0, 0.0,
                           helmet_color=(0.95, 0.82, 0.10), vest_color=(0.92, 0.48, 0.10), shirt_color=(0.16, 0.34, 0.62)),
-                NPCWorker(2, "Jairo (Carretillero)", "carretillero", 8.35, -1.2, fz,
+                NPCWorker(2, "Jairo (Carretillero)", "carretillero", 14.35, -1.35, 0.0,
                           helmet_color=(0.95, 0.42, 0.08), vest_color=(0.45, 0.85, 0.15), shirt_color=(0.22, 0.26, 0.34)),
-                NPCWorker(3, "Mateo (Auxiliar)", "auxiliar", 11.8, -2.2, fz,
+                NPCWorker(3, "Mateo (Auxiliar)", "auxiliar", 17.2, -2.2, 0.0,
                           helmet_color=(0.15, 0.55, 0.92), vest_color=(0.92, 0.78, 0.12), shirt_color=(0.25, 0.48, 0.32)),
             ]
 
-        self.set_toast(f"Cargado diseño FreeCAD: {self.house_title}")
+        mode_lbl = "Exploración" if self.mode == "exploracion" else "Obra"
+        self.set_toast(f"Cargado ({mode_lbl}): {self.house_title}")
 
-    def get_floor_height(self, x, y):
-        # En Doradal existe una rampa lateral en X = [-1.8, -0.1], Y = [1.0, 7.5] que sube a la losa del 2do piso (Z=3.0m)
-        if self.current_house_key == "doradal":
-            if -1.9 <= x <= -0.05 and 1.0 <= y <= 7.5:
-                t = (y - 1.0) / 6.5
-                return 0.10 + t * 2.90
-            if self.player["z"] > 2.2 and -0.2 <= x <= 16.95 and -0.95 <= y <= 10.0:
-                return 3.00
-        return self.floor_z
+    def _base_ground_z(self, x, y):
+        if self.current_house_key == "tipo1":
+            if -3.0 <= x <= 9.0 and -7.0 <= y <= 14.2:
+                return self.floor_z
+            if y > 0.0:
+                return max(-8.2, -0.5 * y)
+            return self.floor_z
+        return 0.0
 
-    def get_nearest_entry_point(self, x, y, tx, ty):
-        """Auxiliar de navegación para que los NPC entren y salgan por las puertas reales del diseño."""
-        if self.current_house_key == "barbosa":
-            # Puerta principal en X=4.4, Y=0.0; puertas interiores en Y=3.5 (X=2.25 y X=4.5), Y=7.0 (X=2.5), Y=10.5 (X=2.5 y X=4.4)
+    def get_floor_height(self, x, y, cur_z=None):
+        """
+        Calcula la cota Z transitable bajo (x, y) considerando el terreno,
+        las losas de FreeCAD (Piso 1 y Piso 2) y los peldaños reales de la escalera.
+        """
+        if cur_z is None:
+            cur_z = self.player["z"]
+
+        candidates = [self._base_ground_z(x, y)]
+
+        # 1. Losas transitables (con margen de 12 cm para cruzar juntas sobre vigas)
+        pad_slab = 0.12
+        for slab in self.walkable_slabs:
+            b = slab["box"]
+            if (b[0] - pad_slab) <= x <= (b[1] + pad_slab) and (b[2] - pad_slab) <= y <= (b[3] + pad_slab):
+                if b[5] <= cur_z + 0.38:
+                    candidates.append(b[5])
+
+        # 2. Peldaños de escalera extraídos de FreeCAD
+        for step in self.stairs_steps:
+            b = step["box"]
+            if (b[0] - 0.04) <= x <= (b[1] + 0.04) and (b[2] - 0.08) <= y <= (b[3] + 0.08):
+                if step["z_top"] <= cur_z + 0.38:
+                    candidates.append(step["z_top"])
+
+        return max(candidates)
+
+    def get_current_zone_label(self):
+        p = self.player
+        x, y, z = p["x"], p["y"], p["z"]
+        if self.current_house_key == "tipo2":
+            if self.stair_bounds is not None:
+                sx0, sx1, sy0, sy1, _ = self.stair_bounds
+                if (sx0 - 0.15) <= x <= (sx1 + 0.15) and (sy0 - 0.1) <= y <= (sy1 + 0.1) and 0.15 < z < 2.95:
+                    return f"Escalera (Z={z:.2f}m)"
+            if z >= 2.75:
+                return f"Segundo Piso (Z={z:.2f}m)"
+            if 9.8 <= x <= 17.5 and 0.0 <= y <= 10.0:
+                return f"Primer Piso - Interior (Z={z:.2f}m)"
+            return f"Planta Baja / Exterior (Z={z:.2f}m)"
+        else:
+            if -0.1 <= x <= 6.1 and 10.5 <= y <= 14.1:
+                return f"Balcón / Terraza Mirador (Z={z:.2f}m)"
+            if -0.1 <= x <= 6.1 and 0.0 <= y < 10.5:
+                return f"Interior Vivienda Tipo 1 (Z={z:.2f}m)"
+            return f"Patio / Exterior (Z={z:.2f}m)"
+
+    def get_nearest_entry_point(self, x, y, cur_z, tx, ty, tz=None):
+        """Auxiliar de navegación para que los NPC entren por puertas y suban la escalera."""
+        if self.current_house_key == "tipo1":
             waypoints = [(4.4, -0.4), (4.4, 1.2), (2.3, 3.5), (4.4, 3.5), (2.5, 7.0), (2.5, 10.5), (4.4, 10.5)]
         else:
-            waypoints = [(2.5, -0.4), (7.2, -0.4), (13.5, -0.4), (2.5, 2.6), (7.2, 2.6), (11.0, 2.6), (13.5, 2.6)]
+            if tz is not None and tz > 2.2 and cur_z < 2.2:
+                # Rutas hacia la base de la escalera y subida por la misma
+                if x < 17.2 or y < 9.5:
+                    return (17.7, max(y, 10.5))
+                return (12.6, 10.5)
+            if cur_z > 2.2 and (tz is None or tz < 1.5):
+                # Bajar por la escalera desde el 2do piso
+                if x > 12.7 and y > 11.0:
+                    return (12.6, 10.5)
+                return (17.6, 10.5)
+            waypoints = [
+                (13.5, -0.5), (13.5, 1.0),
+                (16.6, -0.5), (16.6, 5.4), (15.2, 5.4),
+                (17.7, 5.4), (17.7, 10.5),
+                (12.6, 10.5), (14.5, 11.8),
+            ]
 
         best = (tx, ty)
         best_score = 1e9
@@ -577,25 +673,51 @@ class ConstructionWorld:
         dy = cy - closest_y
         return (dx * dx + dy * dy) < (r * r)
 
-    def resolve_collision(self, old_x, old_y, new_x, new_y, radius=0.26):
+    def resolve_collision(self, old_x, old_y, new_x, new_y, radius=0.26, cur_z=None):
         if not self.collision_enabled:
             return new_x, new_y
-        # Si está en el segundo piso de Doradal, no colisionar con muros del primer piso
-        if self.current_house_key == "doradal" and self.player["z"] > 2.4:
-            return new_x, new_y
+        if cur_z is None:
+            cur_z = self.player["z"]
 
-        colliders = self.meta.get("wall_colliders", []) + self.meta.get("column_colliders", [])
+        body_min_z = cur_z + 0.35
+        body_max_z = cur_z + 1.65
 
-        # Probar avance en X y luego en Y para deslizamiento suave contra los muros
+        raw_colliders = (
+            self.meta.get("wall_colliders", [])
+            + self.meta.get("column_colliders", [])
+            + self.meta.get("railing_colliders", [])
+        )
+        active_boxes = []
+        for c in raw_colliders:
+            b = c["box"]
+            if b[4] < body_max_z and b[5] > body_min_z:
+                active_boxes.append(b)
+
+        # Bloqueadores laterales de los peldaños altos de escalera (no atravesar de lado el cuerpo macizo)
+        for step in self.stairs_steps:
+            b = step["box"]
+            if step["z_top"] > cur_z + 0.38 and b[4] < cur_z + 1.55:
+                active_boxes.append(b)
+
+        # Barandillas laterales y tope de desembarco mientras el personaje está en la escalera
+        if self.stair_bounds is not None:
+            sx0, sx1, sy0, sy1, sz_max = self.stair_bounds
+            if 0.20 < cur_z < (sz_max - 0.12):
+                active_boxes.append([sx0 + 0.15, sx1 - 0.10, sy0 - 0.10, sy0 + 0.02, 0.0, sz_max + 1.5])
+                active_boxes.append([sx0 + 0.15, sx1 - 0.10, sy1 - 0.02, sy1 + 0.10, 0.0, sz_max + 1.5])
+            if cur_z >= (sz_max - 0.25):
+                # Evitar caer por el borde trasero del escalón superior al llegar al 2do piso
+                active_boxes.append([sx0 - 0.36, sx0 - 0.18, sy0 - 0.05, sy1 + 0.05, sz_max - 0.5, sz_max + 1.5])
+
         res_x = new_x
-        for c in colliders:
-            if self._circle_intersects_box(res_x, old_y, radius, c["box"]):
+        for b in active_boxes:
+            if self._circle_intersects_box(res_x, old_y, radius, b):
                 res_x = old_x
                 break
 
         res_y = new_y
-        for c in colliders:
-            if self._circle_intersects_box(res_x, res_y, radius, c["box"]):
+        for b in active_boxes:
+            if self._circle_intersects_box(res_x, res_y, radius, b):
                 res_y = old_y
                 break
 
@@ -603,9 +725,12 @@ class ConstructionWorld:
 
     def player_interact_e(self):
         """Tecla [E]: Agarrar/Soltar Carretilla, o Recoger/Soltar Ladrillos, Bloques y Bultos de Cemento."""
+        if self.mode == "exploracion":
+            self.set_toast("Modo Exploración: solo observación (presiona [M] para volver a Modo Obra).")
+            return
+
         p = self.player
 
-        # 1. Si ya sostiene una carretilla, soltarla
         if p["held_wheelbarrow"] is not None:
             wb = p["held_wheelbarrow"]
             wb.holder = None
@@ -613,10 +738,8 @@ class ConstructionWorld:
             self.set_toast(f"Soltaste la Carretilla #{wb.id} ({wb.get_summary()})")
             return
 
-        # 2. Si está cerca de una carretilla (incluso si la tiene Jairo, puedes relevársela)
         for wb in self.wheelbarrows:
-            if math.hypot(wb.x - p["x"], wb.y - p["y"]) < 1.55:
-                # Si tienes un ítem en la mano, meterlo en la carretilla
+            if math.hypot(wb.x - p["x"], wb.y - p["y"]) < 1.55 and abs(wb.z - p["z"]) < 1.0:
                 if p["carrying_item"] is not None:
                     if wb.add_item(p["carrying_item"]):
                         self.set_toast(f"Cargaste 1 {ITEM_NAMES[p['carrying_item']]} en la Carretilla #{wb.id}")
@@ -625,7 +748,6 @@ class ConstructionWorld:
                         self.set_toast("La carretilla ya está llena o tiene mezcla húmeda.")
                     return
 
-                # Tomar el control de la carretilla
                 if wb.holder is not None and wb.holder != "player":
                     wb.holder.held_wheelbarrow = None
                 wb.holder = "player"
@@ -637,7 +759,6 @@ class ConstructionWorld:
                 )
                 return
 
-        # 3. Si lleva un elemento en las manos, ponerlo en la concretadora, en una zona de obra o en el piso
         if p["carrying_item"] is not None:
             item = p["carrying_item"]
             if math.hypot(self.mixer.x - p["x"], self.mixer.y - p["y"]) < 1.8 and item == "bulto_cemento":
@@ -647,15 +768,14 @@ class ConstructionWorld:
                 return
 
             for zone in self.work_zones:
-                zx, zy, _ = zone["pos"]
-                if math.hypot(zx - p["x"], zy - p["y"]) < 1.65:
+                zx, zy, zz = zone["pos"]
+                if math.hypot(zx - p["x"], zy - p["y"]) < 1.65 and abs(zz - p["z"]) < 1.2:
                     zone["delivered"] += 1
                     self.total_delivered += 1
                     p["carrying_item"] = None
                     self.set_toast(f"Entregaste {ITEM_NAMES[item]} en {zone['name']}!")
                     return
 
-            # Soltar en el piso frente al jugador
             rad = math.radians(p["yaw"])
             self.loose_items.append({
                 "type": item,
@@ -668,19 +788,17 @@ class ConstructionWorld:
             self.set_toast(f"Colocaste {ITEM_NAMES[item]} en el piso.")
             return
 
-        # 4. Intentar recoger un elemento suelto del piso
         for idx, it in enumerate(self.loose_items):
-            if math.hypot(it["x"] - p["x"], it["y"] - p["y"]) < 1.35:
+            if math.hypot(it["x"] - p["x"], it["y"] - p["y"]) < 1.35 and abs(it["z"] - p["z"]) < 1.0:
                 p["carrying_item"] = it["type"]
                 p["has_shovel"] = False
                 self.loose_items.pop(idx)
-                self.set_toast(f"Recogiste {ITEM_NAMES[p['carrying_item']]}. Lllévalo a la carretilla o dentro de la casa.")
+                self.set_toast(f"Recogiste {ITEM_NAMES[p['carrying_item']]}. Llévalo a la carretilla o dentro de la casa.")
                 return
 
-        # 5. Intentar tomar un ladrillo, bloque o bulto de cemento de las estibas
         for st in self.stations:
-            sx, sy, _ = st["pos"]
-            if math.hypot(sx - p["x"], sy - p["y"]) < 1.65:
+            sx, sy, sz = st["pos"]
+            if math.hypot(sx - p["x"], sy - p["y"]) < 1.65 and abs(sz - p["z"]) < 1.0:
                 if st["item_type"] == "arena":
                     p["has_shovel"] = True
                     p["shovel_loaded"] = True
@@ -697,16 +815,17 @@ class ConstructionWorld:
         """
         Tecla [F]:
         - Si sostienes una carretilla llena -> Vaciarla en la zona de obra (o en el piso).
-        - Si tienes la pala (o estás junto a la concretadora y una carretilla que Jairo sostiene) ->
-          Dar una palada para llenar la carretilla que el otro personaje sostiene.
+        - Si estás junto a la concretadora y una carretilla -> Dar una palada para llenar la carretilla.
         """
+        if self.mode == "exploracion":
+            self.set_toast("Modo Exploración: solo observación (presiona [M] para volver a Modo Obra).")
+            return
+
         p = self.player
 
-        # 1. Si sostiene carretilla: descargarla
         if p["held_wheelbarrow"] is not None:
             wb = p["held_wheelbarrow"]
             if wb.is_empty():
-                # Si está cerca de la concretadora, pedirle a Don Chucho que la llene o llenarla
                 if math.hypot(wb.x - self.mixer.x, wb.y - self.mixer.y) < 3.5:
                     self.crew_command = "fill_player_wb"
                     self.set_toast("¡Don Chucho viene con la pala a llenar tu carretilla mientras tú la sostienes!")
@@ -714,17 +833,15 @@ class ConstructionWorld:
                     self.set_toast("La carretilla está vacía. Llévala junto a la concretadora o cárgale materiales.")
                 return
 
-            # Verificar si está en una zona de obra dentro de la casa
             for zone in self.work_zones:
-                zx, zy, _ = zone["pos"]
-                if math.hypot(zx - wb.x, zy - wb.y) < 2.2:
+                zx, zy, zz = zone["pos"]
+                if math.hypot(zx - wb.x, zy - wb.y) < 2.2 and abs(zz - wb.z) < 1.2:
                     count = wb.dump_all()
                     zone["delivered"] += count
                     self.total_delivered += count
                     self.set_toast(f"¡Descargaste la carretilla en {zone['name']} (+{count} unidades de obra)!")
                     return
 
-            # Si la vacía fuera de una zona, dejar los ítems en el piso
             if wb.contents:
                 for i, it_type in enumerate(wb.contents):
                     self.loose_items.append({
@@ -738,10 +855,9 @@ class ConstructionWorld:
             self.set_toast(f"Vaciaste la carretilla aquí ({count} elementos).")
             return
 
-        # 2. Palear mezcla dentro de una carretilla cercana (especialmente la que sostiene Jairo)
         nearest_wb = None
         for wb in self.wheelbarrows:
-            if math.hypot(wb.x - p["x"], wb.y - p["y"]) < 2.3:
+            if math.hypot(wb.x - p["x"], wb.y - p["y"]) < 2.3 and abs(wb.z - p["z"]) < 1.0:
                 nearest_wb = wb
                 break
 
@@ -763,7 +879,6 @@ class ConstructionWorld:
                 self.set_toast("¡Esa carretilla ya está llena (3/3)!")
             return
 
-        # 3. Encender / Apagar concretadora si está cerca
         if math.hypot(self.mixer.x - p["x"], self.mixer.y - p["y"]) < 2.2:
             self.mixer.is_running = not self.mixer.is_running
             estado = "ENCENDIDA" if self.mixer.is_running else "PAUSADA"
@@ -773,6 +888,10 @@ class ConstructionWorld:
         self.set_toast("Acércate a la carretilla que sostiene Jairo para palear mezcla con [F], o vacía tu carretilla.")
 
     def toggle_shovel(self):
+        if self.mode == "exploracion":
+            self.set_toast("Modo Exploración activo: sin herramientas de obra. Presiona [M] para Modo Obra.")
+            return
+
         p = self.player
         if p["held_wheelbarrow"] is not None:
             self.set_toast("Primero suelta la carretilla con [E] para usar la pala.")
@@ -785,6 +904,10 @@ class ConstructionWorld:
             self.set_toast("Guardaste la Pala de Obra.")
 
     def set_crew_order(self, order_key):
+        if self.mode == "exploracion":
+            self.set_toast("Modo Exploración activo: sin cuadrilla. Presiona [M] para Modo Obra.")
+            return
+
         self.crew_command = order_key
         if order_key == "auto":
             self.set_toast("Orden a Cuadrilla [1]: Trabajo cooperativo autónomo en toda la obra.")
@@ -795,27 +918,28 @@ class ConstructionWorld:
         elif order_key == "fill_player_wb":
             self.set_toast("Orden a Cuadrilla [3]: ¡Sostén tu carretilla con [E] y Don Chucho viene a llenártela con la pala!")
         elif order_key == "follow_player":
-            self.set_toast("Orden a Cuadrilla [4]: ¡Mateo te sigue al interior de la casa!")
+            self.set_toast("Orden a Cuadrilla [4]: ¡Mateo te sigue por la vivienda!")
 
-    def update(self, dt, move_forward, move_right):
+    def update(self, dt, move_forward, move_right, sprint=False):
         if self.toast_timer > 0.0:
             self.toast_timer = max(0.0, self.toast_timer - dt)
 
         # Actualizar partículas de mezcla
-        alive_particles = []
-        for pt in self.particles:
-            pt["life"] -= dt
-            if pt["life"] > 0:
-                pt["x"] += pt["vx"] * dt
-                pt["y"] += pt["vy"] * dt
-                pt["z"] += pt["vz"] * dt
-                pt["vz"] -= 2.8 * dt
-                alive_particles.append(pt)
-        self.particles = alive_particles
+        if self.mode == "obra" and self.particles:
+            alive_particles = []
+            for pt in self.particles:
+                pt["life"] -= dt
+                if pt["life"] > 0:
+                    pt["x"] += pt["vx"] * dt
+                    pt["y"] += pt["vy"] * dt
+                    pt["z"] += pt["vz"] * dt
+                    pt["vz"] -= 2.8 * dt
+                    alive_particles.append(pt)
+            self.particles = alive_particles
 
         # Movimiento del jugador
         p = self.player
-        if p["shovel_anim_timer"] > 0.0:
+        if p["shovel_anim_timer"] > 0.0 and self.mode == "obra":
             p["shovel_anim_timer"] = max(0.0, p["shovel_anim_timer"] - dt)
             p["anim_state"] = "shovel_fill"
             p["anim_phase"] += dt * 3.0
@@ -832,13 +956,16 @@ class ConstructionWorld:
                 if vnorm > 0:
                     vx /= vnorm
                     vy /= vnorm
-                spd = p["speed"] * (0.82 if p["held_wheelbarrow"] else 1.0)
+                spd = p["speed"]
+                if p["held_wheelbarrow"] is not None:
+                    spd *= 0.82
+                elif sprint:
+                    spd *= 1.65
                 nx = p["x"] + vx * spd * dt
                 ny = p["y"] + vy * spd * dt
-                nx, ny = self.resolve_collision(p["x"], p["y"], nx, ny, radius=0.26)
+                nx, ny = self.resolve_collision(p["x"], p["y"], nx, ny, radius=0.26, cur_z=p["z"])
                 p["x"], p["y"] = nx, ny
-                p["z"] = self.get_floor_height(nx, ny)
-                p["anim_phase"] += dt * 1.6
+                p["anim_phase"] += dt * (2.2 if sprint else 1.6)
                 if p["held_wheelbarrow"]:
                     p["anim_state"] = "hold_wheelbarrow"
                 elif p["carrying_item"]:
@@ -853,20 +980,38 @@ class ConstructionWorld:
                 else:
                     p["anim_state"] = "idle"
 
-        # Si el jugador sostiene una carretilla, actualizar la posición de la carretilla frente a él
-        if p["held_wheelbarrow"] is not None:
-            wb = p["held_wheelbarrow"]
-            rad = math.radians(p["yaw"])
-            wb_x = p["x"] + math.cos(rad) * 0.75
-            wb_y = p["y"] + math.sin(rad) * 0.75
-            wb_x, wb_y = self.resolve_collision(wb.x, wb.y, wb_x, wb_y, radius=0.28)
-            wb.x, wb.y = wb_x, wb_y
-            wb.z = p["z"]
-            wb.yaw = p["yaw"]
+        # Físicas verticales: escalones de escalera, losas de 2do piso y gravedad suave
+        target_z = self.get_floor_height(p["x"], p["y"], cur_z=p["z"])
+        if target_z >= p["z"] - 0.45:
+            p["z"] = target_z
+            p["vz"] = 0.0
+        else:
+            p["vz"] -= 14.0 * dt
+            p["z"] += p["vz"] * dt
+            if p["z"] <= target_z:
+                p["z"] = target_z
+                p["vz"] = 0.0
 
-        # Actualizar concretadora, carretillas y los 3 obreros ayudantes
-        self.mixer.update(dt)
-        for wb in self.wheelbarrows:
-            wb.update(dt)
-        for npc in self.npcs:
-            npc.update(dt, self)
+        # Suavizado visual para subir/bajar los 17 escalones sin saltos bruscos de cámara
+        z_diff = p["z"] - p["smooth_z"]
+        if abs(z_diff) < 0.002:
+            p["smooth_z"] = p["z"]
+        else:
+            p["smooth_z"] += z_diff * min(1.0, 16.0 * dt)
+
+        if self.mode == "obra":
+            if p["held_wheelbarrow"] is not None:
+                wb = p["held_wheelbarrow"]
+                rad = math.radians(p["yaw"])
+                wb_x = p["x"] + math.cos(rad) * 0.75
+                wb_y = p["y"] + math.sin(rad) * 0.75
+                wb_x, wb_y = self.resolve_collision(wb.x, wb.y, wb_x, wb_y, radius=0.28, cur_z=p["z"])
+                wb.x, wb.y = wb_x, wb_y
+                wb.z = p["z"]
+                wb.yaw = p["yaw"]
+
+            self.mixer.update(dt)
+            for wb in self.wheelbarrows:
+                wb.update(dt)
+            for npc in self.npcs:
+                npc.update(dt, self)

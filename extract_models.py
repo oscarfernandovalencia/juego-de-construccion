@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
 Extractor de geometría 3D y metadatos arquitectónicos/estructurales desde FreeCAD (.FCStd)
-para las casas de Barbosa (ArquitectonicoBarbosa.FCStd) y Doradal (ArquitectonicoDoradal.FCStd).
+para las viviendas:
+- Vivienda_Estructura_Metalica_Tipo_01.FCStd (Vivienda Tipo 1)
+- Vivienda_Aporticado_Metalica_Tipo_02.FCStd (Vivienda Tipo 2, 2 pisos con escalera)
+
 Convierte las formas BREP y mallas de FreeCAD a mallas triangulares optimizadas (.npz + .json)
-con normales por cara, colores por categoría constructiva y cajas de colisión con vanos de puertas.
+con normales por cara, colores por categoría constructiva, cajas de colisión 3D por nivel,
+vanos de puertas emparejados con sus muros anfitriones, losas transitables y peldaños de escalera.
 """
 
 import os
@@ -20,12 +24,13 @@ import FreeCAD
 
 CATEGORY_STYLES = {
     "slab":      {"color": [0.76, 0.75, 0.72, 1.0], "name": "Losas y Pisos de Concreto"},
+    "stairs":    {"color": [0.68, 0.66, 0.62, 1.0], "name": "Escaleras y Peldaños"},
     "column":    {"color": [0.42, 0.46, 0.52, 1.0], "name": "Columnas Estructurales"},
     "beam":      {"color": [0.48, 0.52, 0.58, 1.0], "name": "Vigas y Correas"},
     "wall":      {"color": [0.86, 0.52, 0.34, 1.0], "name": "Muros de Mampostería / Bloque"},
     "door":      {"color": [0.55, 0.36, 0.20, 1.0], "name": "Puertas y Carpintería"},
     "window":    {"color": [0.55, 0.80, 0.92, 0.55], "name": "Ventanas y Vidrios"},
-    "roof":      {"color": [0.30, 0.36, 0.42, 1.0], "name": "Estructura de Cubierta / Cerchas"},
+    "roof":      {"color": [0.30, 0.36, 0.42, 1.0], "name": "Estructura de Cubierta / Tejas"},
     "railing":   {"color": [0.22, 0.25, 0.28, 1.0], "name": "Barandas y Pasamanos"},
     "sanitary":  {"color": [0.95, 0.96, 0.98, 1.0], "name": "Aparatos Sanitarios"},
     "rebar":     {"color": [0.72, 0.32, 0.18, 1.0], "name": "Acero de Refuerzo (Figuraciones)"},
@@ -42,6 +47,8 @@ def classify_object(obj):
         return "rebar"
     if obj.TypeId == "Mesh::Feature" or "sanitary" in name or "sanitary" in label:
         return "sanitary"
+    if name.startswith("stairs") or "escalera" in label or ifc == "stair":
+        return "stairs"
     if name.startswith("window"):
         if "puerta" in label or "door" in ifc:
             return "door"
@@ -50,9 +57,23 @@ def classify_object(obj):
         return "wall"
     if "losa" in label or "piso" in label or "slab" in ifc:
         return "slab"
-    if "pasamanos" in label or "poste" in label or "baranda" in label:
+    if (
+        "pasamanos" in label
+        or "poste" in label
+        or "baranda" in label
+        or "barandilla" in label
+        or name.startswith("pipe")
+    ):
         return "railing"
-    if "celos" in label or "cercha" in label or "correatecho" in label or ("vigac" in label and "vigacim" not in label):
+    if (
+        "teja" in label
+        or "celos" in label
+        or "cercha" in label
+        or "correatecho" in label
+        or "corream" in label
+        or ("vigac" in label and "vigacim" not in label)
+        or ifc == "plate"
+    ):
         return "roof"
     if "columna" in label or ("column" in ifc and "viga" not in label and "correa" not in label):
         return "column"
@@ -65,12 +86,21 @@ def should_include_object(obj):
     # Ignorar grupos y contenedores
     if hasattr(obj, "Group") or obj.Name == "Site":
         return False
-    # Ignorar uniones booleanas auxiliares de losas en Doradal para evitar Z-fighting
+    # Ignorar LinkGroup (sus elementos hijos ya están en el documento)
+    if obj.TypeId == "App::LinkGroup":
+        return False
+    # Ignorar uniones booleanas auxiliares de losas para evitar Z-fighting
     if obj.TypeId == "Part::MultiFuse":
         return False
     if obj.TypeId in ("Sketcher::SketchObject", "Part::Part2DObjectPython", "App::MaterialObjectPython"):
         return False
-    if obj.Name.startswith("Axis") or obj.Name.startswith("Profile") or obj.Name.startswith("Rectangle") or obj.Name.startswith("Wire"):
+    if (
+        obj.Name.startswith("Axis")
+        or obj.Name.startswith("Profile")
+        or obj.Name.startswith("Rectangle")
+        or obj.Name.startswith("Wire")
+        or obj.Name.startswith("RailingWire")
+    ):
         return False
 
     if obj.TypeId == "Mesh::Feature":
@@ -117,10 +147,53 @@ def tessellate_object(obj, tolerance=15.0):
     return tris.astype(np.float32), normals.astype(np.float32)
 
 
-def subtract_openings_from_wall(wall_bb, openings):
+def extract_stair_steps(obj):
+    """Extrae las huellas (peldaños transitables) de un objeto escalera de FreeCAD en metros."""
+    steps = []
+    if not hasattr(obj, "Shape") or not obj.Shape:
+        return steps
+
+    riser_est = float(getattr(obj, "RiserHeight", 190.0)) * 0.001
+    if riser_est <= 0.01:
+        riser_est = 0.19
+
+    for face in obj.Shape.Faces:
+        fbb = face.BoundBox
+        if not fbb.isValid():
+            continue
+        # Cara horizontal (huella de escalón)
+        if abs(fbb.ZMax - fbb.ZMin) < 1.5 and fbb.XLength > 50.0 and fbb.YLength > 50.0:
+            try:
+                u0, u1, v0, v1 = face.ParameterRange
+                norm = face.normalAt((u0 + u1) * 0.5, (v0 + v1) * 0.5)
+                if norm.z < 0.7:
+                    continue
+            except Exception:
+                continue
+
+            z_top = fbb.ZMax * 0.001
+            if z_top <= 0.01:
+                continue
+            steps.append({
+                "box": [
+                    round(fbb.XMin * 0.001, 4),
+                    round(fbb.XMax * 0.001, 4),
+                    round(fbb.YMin * 0.001, 4),
+                    round(fbb.YMax * 0.001, 4),
+                    round(max(0.0, z_top - riser_est), 4),
+                    round(z_top, 4),
+                ],
+                "z_top": round(z_top, 4),
+            })
+
+    steps.sort(key=lambda s: s["z_top"])
+    return steps
+
+
+def subtract_openings_from_wall(wall_name, wall_bb, openings):
     """
-    Divide la caja de colisión 2D de un muro [xmin, xmax, ymin, ymax, zmin, zmax]
-    restando los vanos de puertas o ventanales de piso que intersecten el muro.
+    Divide la caja de colisión de un muro [xmin, xmax, ymin, ymax, zmin, zmax]
+    restando los vanos de puertas o ventanales de piso que pertenecen a ese muro.
     """
     segments = [wall_bb]
     dx = wall_bb[1] - wall_bb[0]
@@ -128,26 +201,32 @@ def subtract_openings_from_wall(wall_bb, openings):
     horizontal_along_x = dx >= dy
 
     for op in openings:
+        op_hosts = op.get("hosts")
+        if op_hosts is not None and wall_name not in op_hosts:
+            continue
+
+        op_box = op["box"]
+        # Verificar superposición vertical (Z) entre el vano y el muro
+        if op_box[5] <= wall_bb[4] + 0.10 or op_box[4] >= wall_bb[5] - 0.10:
+            continue
+
         new_segments = []
         for seg in segments:
-            # Verificar intersección 2D con margen de 0.18 m para el espesor del muro
-            ix_min = max(seg[0] - 0.18, op[0])
-            ix_max = min(seg[1] + 0.18, op[1])
-            iy_min = max(seg[2] - 0.18, op[2])
-            iy_max = min(seg[3] + 0.18, op[3])
+            ix_min = max(seg[0] - 0.18, op_box[0])
+            ix_max = min(seg[1] + 0.18, op_box[1])
+            iy_min = max(seg[2] - 0.18, op_box[2])
+            iy_max = min(seg[3] + 0.18, op_box[3])
             if ix_max > ix_min and iy_max > iy_min:
                 if horizontal_along_x:
-                    # Recortar a lo largo de X
-                    cut_min = op[0] - 0.05
-                    cut_max = op[1] + 0.05
+                    cut_min = op_box[0] - 0.05
+                    cut_max = op_box[1] + 0.05
                     if cut_min > seg[0] + 0.08:
                         new_segments.append([seg[0], min(seg[1], cut_min), seg[2], seg[3], seg[4], seg[5]])
                     if cut_max < seg[1] - 0.08:
                         new_segments.append([max(seg[0], cut_max), seg[1], seg[2], seg[3], seg[4], seg[5]])
                 else:
-                    # Recortar a lo largo de Y
-                    cut_min = op[2] - 0.05
-                    cut_max = op[3] + 0.05
+                    cut_min = op_box[2] - 0.05
+                    cut_max = op_box[3] + 0.05
                     if cut_min > seg[2] + 0.08:
                         new_segments.append([seg[0], seg[1], seg[2], min(seg[3], cut_min), seg[4], seg[5]])
                     if cut_max < seg[3] - 0.08:
@@ -165,31 +244,48 @@ def extract_fcstd(fcstd_path, out_prefix, floor_z_m, extra_openings=None):
     buckets = {cat: {"tris": [], "norms": []} for cat in CATEGORY_STYLES}
     raw_walls = []
     columns_coll = []
+    railing_coll = []
     walkable_slabs = []
-    openings = list(extra_openings or [])
+    stairs_steps = []
+    openings = [
+        {"label": op[6], "box": op[:6], "hosts": None}
+        for op in (extra_openings or [])
+    ]
     object_counts = {cat: 0 for cat in CATEGORY_STYLES}
 
-    # Primero recolectar todas las puertas y ventanales a nivel de piso como vanos transitables
+    # Primero recolectar todas las puertas y ventanales transitables con su muro anfitrión
     for obj in doc.Objects:
         if obj.Name.startswith("Window") and hasattr(obj, "Shape") and obj.Shape:
             bb = obj.Shape.BoundBox
             if bb.isValid():
                 zmin = bb.ZMin * 0.001
                 zmax = bb.ZMax * 0.001
-                # Si la base de la puerta/ventanal llega cerca del nivel del piso (+0.35 m), es un vano de paso
-                if zmin <= floor_z_m + 0.35 and zmax >= floor_z_m + 1.8:
-                    openings.append([
-                        bb.XMin * 0.001, bb.XMax * 0.001,
-                        bb.YMin * 0.001, bb.YMax * 0.001,
-                        zmin, zmax, obj.Label
-                    ])
+                height = zmax - zmin
+                ifc = getattr(obj, "IfcType", "").lower()
+                label_l = obj.Label.lower()
+                # Puertas o ventanales de altura completa (alrededor de >= 1.8m y cerca de algún nivel de piso)
+                is_full_opening = (
+                    "puerta" in label_l
+                    or ifc == "door"
+                    or (height >= 1.8 and (zmin <= floor_z_m + 0.35 or zmin >= 2.7))
+                )
+                if is_full_opening:
+                    hosts = [h.Name for h in getattr(obj, "Hosts", [])] if hasattr(obj, "Hosts") else []
+                    openings.append({
+                        "label": obj.Label,
+                        "box": [
+                            bb.XMin * 0.001, bb.XMax * 0.001,
+                            bb.YMin * 0.001, bb.YMax * 0.001,
+                            zmin, zmax,
+                        ],
+                        "hosts": hosts if hosts else None,
+                    })
 
     for obj in doc.Objects:
         if not should_include_object(obj):
             continue
 
         cat = classify_object(obj)
-        # Usar tolerancia más gruesa en barras de refuerzo para mantener altos FPS
         tol = 45.0 if cat == "rebar" else 15.0
         tris, norms = tessellate_object(obj, tolerance=tol)
         if len(tris) == 0:
@@ -200,28 +296,41 @@ def extract_fcstd(fcstd_path, out_prefix, floor_z_m, extra_openings=None):
         object_counts[cat] += 1
 
         if obj.TypeId != "Mesh::Feature":
-            bb = obj.Shape.BoundBox
-            box_m = [
-                bb.XMin * 0.001, bb.XMax * 0.001,
-                bb.YMin * 0.001, bb.YMax * 0.001,
-                bb.ZMin * 0.001, bb.ZMax * 0.001,
-            ]
-            if cat == "wall":
-                # Solo colisionar muros que estén a altura de persona (no dinteles altos)
-                if box_m[4] < floor_z_m + 1.7 and box_m[5] > floor_z_m + 0.3:
-                    raw_walls.append((obj.Label, box_m))
-            elif cat == "column":
-                if box_m[4] < floor_z_m + 1.8 and box_m[5] > floor_z_m + 0.2:
+            solids = obj.Shape.Solids if hasattr(obj.Shape, "Solids") and obj.Shape.Solids else [obj.Shape]
+            for solid in solids:
+                bb = solid.BoundBox
+                if not bb.isValid():
+                    continue
+                box_m = [
+                    bb.XMin * 0.001, bb.XMax * 0.001,
+                    bb.YMin * 0.001, bb.YMax * 0.001,
+                    bb.ZMin * 0.001, bb.ZMax * 0.001,
+                ]
+                if cat == "wall":
+                    raw_walls.append((obj.Name, obj.Label, box_m))
+                elif cat == "column":
                     columns_coll.append({"label": obj.Label, "box": box_m})
-            elif cat == "slab":
-                walkable_slabs.append({"label": obj.Label, "box": box_m})
+                elif cat == "railing":
+                    # Barandas de balcón planas (evitar barandillas diagonales altas de escalera)
+                    if (box_m[5] - box_m[4]) < 2.2:
+                        railing_coll.append({"label": obj.Label, "box": box_m})
+                elif cat == "slab":
+                    # Excluir losa de cimentación enterrada o losas bajo 0
+                    if box_m[5] >= -0.05:
+                        walkable_slabs.append({"label": obj.Label, "box": box_m})
+                elif cat == "beam":
+                    # Vigas horizontales de entrepiso (sirven como puente entre losas del 2do piso)
+                    if 2.0 <= box_m[5] <= 3.5 and (box_m[5] - box_m[4]) <= 0.45:
+                        walkable_slabs.append({"label": obj.Label, "box": box_m})
+            if cat == "stairs":
+                stairs_steps.extend(extract_stair_steps(obj))
 
     # Procesar segmentos de colisión de muros descontando puertas/vanos
     wall_colliders = []
-    for label, wbox in raw_walls:
-        segs = subtract_openings_from_wall(wbox, openings)
+    for wname, wlabel, wbox in raw_walls:
+        segs = subtract_openings_from_wall(wname, wbox, openings)
         for s in segs:
-            wall_colliders.append({"label": label, "box": s})
+            wall_colliders.append({"label": wlabel, "box": s})
 
     npz_dict = {}
     summary_cats = {}
@@ -257,16 +366,22 @@ def extract_fcstd(fcstd_path, out_prefix, floor_z_m, extra_openings=None):
         "categories": summary_cats,
         "wall_colliders": wall_colliders,
         "column_colliders": columns_coll,
+        "railing_colliders": railing_coll,
         "walkable_slabs": walkable_slabs,
+        "stairs_steps": stairs_steps,
         "openings": [
-            {"label": op[6], "box": op[:6]} for op in openings
+            {"label": op["label"], "box": op["box"]} for op in openings
         ],
     }
     with open(f"{out_prefix}_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
     FreeCAD.closeDocument(doc.Name)
-    print(f"  -> Guardado {out_prefix}_scene.npz ({total_tris} triángulos) y {out_prefix}_meta.json ({len(wall_colliders)} segmentos de muro, {len(openings)} vanos).")
+    print(
+        f"  -> Guardado {out_prefix}_scene.npz ({total_tris} triángulos) y "
+        f"{out_prefix}_meta.json ({len(wall_colliders)} segs muro, "
+        f"{len(stairs_steps)} peldaños, {len(openings)} vanos)."
+    )
 
 
 def main():
@@ -274,36 +389,24 @@ def main():
     assets_dir = os.path.join(base_dir, "assets")
     os.makedirs(assets_dir, exist_ok=True)
 
-    # 1. Casa Barbosa: Piso principal sobre losa nivel Z = 1.32 m
-    barbosa_fc = os.path.join(base_dir, "ArquitectonicoBarbosa.FCStd")
-    if os.path.exists(barbosa_fc):
+    # 1. Vivienda Tipo 1: Estructura Metálica en Ladera (Losa nivel Z = 1.32 m)
+    tipo1_fc = os.path.join(base_dir, "Vivienda_Estructura_Metalica_Tipo_01.FCStd")
+    if os.path.exists(tipo1_fc):
         extract_fcstd(
-            barbosa_fc,
-            os.path.join(assets_dir, "barbosa"),
+            tipo1_fc,
+            os.path.join(assets_dir, "tipo1"),
             floor_z_m=1.32,
             extra_openings=[],
         )
 
-    # 2. Casa Doradal: Piso principal sobre losa nivel Z = 0.10 m
-    # Agregamos vanos de paso de obra en muros internos aún sin puerta modelada para permitir recorrer todos los salones
-    doradal_fc = os.path.join(base_dir, "ArquitectonicoDoradal.FCStd")
-    if os.path.exists(doradal_fc):
-        doradal_extra_openings = [
-            # Paso frontal al módulo central (MuroP1009)
-            [6.60, 7.80, -0.05, 0.15, 0.10, 2.30, "VanoObraCentralFrente"],
-            # Paso interior entre módulo 1 (Montallantas) y módulo 2 (MuroP1007)
-            [4.60, 4.82, 2.10, 3.20, 0.10, 2.30, "VanoObraMod1Mod2"],
-            # Paso interior entre módulo 2 y módulo 3 (MuroP1010)
-            [9.74, 9.95, 2.10, 3.20, 0.10, 2.30, "VanoObraMod2Mod3"],
-            # Paso interior en MuroSucesion hacia zona restaurante/apartamento
-            [12.35, 12.55, 2.10, 3.20, 0.10, 2.30, "VanoObraSucesion1"],
-            [12.35, 12.55, 5.30, 6.30, 0.10, 2.30, "VanoObraSucesion2"],
-        ]
+    # 2. Vivienda Tipo 2: Aporticada + Ampliación Metálica (Piso 1 Z = 0.10 m, Escalera hasta Piso 2 Z = 3.00-3.20 m)
+    tipo2_fc = os.path.join(base_dir, "Vivienda_Aporticado_Metalica_Tipo_02.FCStd")
+    if os.path.exists(tipo2_fc):
         extract_fcstd(
-            doradal_fc,
-            os.path.join(assets_dir, "doradal"),
+            tipo2_fc,
+            os.path.join(assets_dir, "tipo2"),
             floor_z_m=0.10,
-            extra_openings=doradal_extra_openings,
+            extra_openings=[],
         )
 
 

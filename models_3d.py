@@ -467,3 +467,147 @@ def draw_character(
 
     glPopMatrix()
     glPopMatrix()
+
+
+# Nubes suaves en el cielo: (x_base, y_base, z_altura, escala, velocidad_viento)
+_CLOUD_PRESETS = [
+    (-35.0, -28.0, 26.0, 1.20, 0.45),
+    (-12.0, -34.0, 29.0, 0.95, 0.35),
+    (18.0,  -30.0, 25.0, 1.35, 0.40),
+    (42.0,  -20.0, 28.0, 1.10, 0.50),
+    (-40.0,  -2.0, 30.0, 1.25, 0.38),
+    (-18.0,   6.0, 24.5, 1.05, 0.48),
+    (12.0,   14.0, 27.5, 1.40, 0.36),
+    (36.0,    8.0, 25.5, 1.15, 0.44),
+    (-32.0,  26.0, 28.0, 1.30, 0.42),
+    (-4.0,   32.0, 25.0, 1.00, 0.52),
+    (26.0,   34.0, 29.5, 1.25, 0.34),
+    (46.0,   28.0, 26.5, 1.10, 0.46),
+    (-46.0,  42.0, 27.0, 1.20, 0.39),
+    (6.0,   -10.0, 31.0, 0.90, 0.41),
+    (28.0,  -12.0, 27.0, 1.05, 0.47),
+]
+
+
+def build_sky_dome_list(radius=68.0):
+    """Compila una cúpula celeste con gradiente suave desde el horizonte hasta el cenit."""
+    rings = [
+        (-0.25, (0.56, 0.72, 0.84)),
+        (0.00,  (0.76, 0.89, 0.98)),
+        (0.12,  (0.60, 0.80, 0.96)),
+        (0.32,  (0.42, 0.69, 0.94)),
+        (0.60,  (0.26, 0.55, 0.88)),
+        (0.88,  (0.18, 0.45, 0.82)),
+        (1.00,  (0.15, 0.40, 0.78)),
+    ]
+    slices = 28
+    dl = glGenLists(1)
+    glNewList(dl, GL_COMPILE)
+    for idx in range(len(rings) - 1):
+        s0, c0 = rings[idx]
+        s1, c1 = rings[idx + 1]
+        z0 = radius * s0
+        r0 = radius * math.sqrt(max(0.0, 1.0 - s0 * s0))
+        z1 = radius * s1
+        r1 = radius * math.sqrt(max(0.0, 1.0 - s1 * s1))
+
+        glBegin(GL_QUAD_STRIP)
+        for i in range(slices + 1):
+            ang = 2.0 * math.pi * i / slices
+            ca, sa = math.cos(ang), math.sin(ang)
+            glColor3f(*c1)
+            glVertex3f(r1 * ca, r1 * sa, z1)
+            glColor3f(*c0)
+            glVertex3f(r0 * ca, r0 * sa, z0)
+        glEnd()
+    glEndList()
+    return dl
+
+
+def _draw_sun_disc(cx, cy, cz, rx, ry, rz, ux, uy, uz, radius, center_col, edge_col, slices=24):
+    """Dibuja un disco radial (sol o halo) orientado hacia la cámara."""
+    glBegin(GL_TRIANGLE_FAN)
+    glColor4f(*center_col)
+    glVertex3f(cx, cy, cz)
+    glColor4f(*edge_col)
+    for i in range(slices + 1):
+        ang = 2.0 * math.pi * i / slices
+        ca, sa = math.cos(ang) * radius, math.sin(ang) * radius
+        glVertex3f(cx + rx * ca + ux * sa, cy + ry * ca + uy * sa, cz + rz * ca + uz * sa)
+    glEnd()
+
+
+def _draw_cloud_puff(cx, cy, cz, rx, ry, rz):
+    """Dibuja un volumen de nube suave con parte superior luminosa e inferior sombreada."""
+    lat_steps = 5
+    lon_steps = 10
+    for j in range(lat_steps):
+        p0 = -0.5 * math.pi + math.pi * j / lat_steps
+        p1 = -0.5 * math.pi + math.pi * (j + 1) / lat_steps
+        cp0, sp0 = math.cos(p0), math.sin(p0)
+        cp1, sp1 = math.cos(p1), math.sin(p1)
+
+        # Tinte suave: blanco cálido arriba, azulado suave debajo
+        t0 = 0.5 + 0.5 * sp0
+        t1 = 0.5 + 0.5 * sp1
+        col0 = (0.85 + 0.14 * t0, 0.90 + 0.09 * t0, 0.96 + 0.04 * t0, 0.88)
+        col1 = (0.85 + 0.14 * t1, 0.90 + 0.09 * t1, 0.96 + 0.04 * t1, 0.88)
+
+        glBegin(GL_QUAD_STRIP)
+        for i in range(lon_steps + 1):
+            ang = 2.0 * math.pi * i / lon_steps
+            ca, sa = math.cos(ang), math.sin(ang)
+            glColor4f(*col1)
+            glVertex3f(cx + rx * cp1 * ca, cy + ry * cp1 * sa, cz + rz * sp1)
+            glColor4f(*col0)
+            glVertex3f(cx + rx * cp0 * ca, cy + ry * cp0 * sa, cz + rz * sp0)
+        glEnd()
+
+
+def draw_sky_and_clouds(sky_dl, eye_x, eye_y, eye_z, anim_time):
+    """Dibuja el cielo degradado, el sol con halo atmosférico y las nubes en movimiento."""
+    glDisable(GL_DEPTH_TEST)
+    glDisable(GL_LIGHTING)
+    glDepthMask(GL_FALSE)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+    # 1. Cúpula de cielo centrada en la cámara
+    glPushMatrix()
+    glTranslatef(eye_x, eye_y, eye_z)
+    if sky_dl is not None:
+        glCallList(sky_dl)
+
+    # 2. Sol alineado con la luz principal en lo alto del cielo
+    sx, sy, sz = 0.40, -0.48, 0.78
+    norm = math.sqrt(sx * sx + sy * sy + sz * sz)
+    sx, sy, sz = sx / norm, sy / norm, sz / norm
+    sun_dist = 56.0
+    scx, scy, scz = sx * sun_dist, sy * sun_dist, sz * sun_dist
+
+    # Base ortogonal perpendicular a la dirección del sol
+    rx, ry, rz = sy, -sx, 0.0
+    rnorm = math.hypot(rx, ry)
+    rx, ry = rx / rnorm, ry / rnorm
+    ux = sy * rz - sz * ry
+    uy = sz * rx - sx * rz
+    uz = sx * ry - sy * rx
+
+    _draw_sun_disc(scx, scy, scz, rx, ry, rz, ux, uy, uz, 13.0, (1.0, 0.96, 0.80, 0.34), (0.45, 0.72, 0.94, 0.0))
+    _draw_sun_disc(scx, scy, scz, rx, ry, rz, ux, uy, uz, 5.4, (1.0, 0.98, 0.88, 0.72), (1.0, 0.92, 0.68, 0.0))
+    _draw_sun_disc(scx, scy, scz, rx, ry, rz, ux, uy, uz, 2.3, (1.0, 0.99, 0.92, 1.0), (1.0, 0.96, 0.80, 0.98))
+    glPopMatrix()
+
+    # 3. Nubes 3D desplazándose suavemente por el cielo
+    for x0, y0, z0, sc, spd in _CLOUD_PRESETS:
+        cx = ((x0 + anim_time * spd + 55.0) % 110.0) - 55.0 + 10.0
+        cy = y0 + 5.0
+        cz = z0
+        _draw_cloud_puff(cx, cy, cz, 3.6 * sc, 2.2 * sc, 1.15 * sc)
+        _draw_cloud_puff(cx - 2.3 * sc, cy + 0.4 * sc, cz - 0.15 * sc, 2.4 * sc, 1.7 * sc, 0.90 * sc)
+        _draw_cloud_puff(cx + 2.4 * sc, cy - 0.3 * sc, cz - 0.10 * sc, 2.6 * sc, 1.8 * sc, 0.95 * sc)
+        _draw_cloud_puff(cx + 0.5 * sc, cy + 0.9 * sc, cz + 0.45 * sc, 2.1 * sc, 1.5 * sc, 0.85 * sc)
+
+    glDepthMask(GL_TRUE)
+    glEnable(GL_LIGHTING)
+    glEnable(GL_DEPTH_TEST)

@@ -17,12 +17,12 @@ export PYTHONPATH="/usr/lib/freecad/lib:/usr/lib/freecad/Mod:${PYTHONPATH}"
 
 echo "=========================================================="
 echo "  Entorno virtual activado: $(which python)"
-echo "  Proyecto: Simulador de Obra 3D - Casas Barbosa y Doradal"
+echo "  Proyecto: Simulador 3D - Viviendas Tipo 1 y Tipo 2"
 echo "=========================================================="
 
 # Si aún no se han extraído las mallas optimizadas de FreeCAD, extraerlas
-if [ ! -f "$SCRIPT_DIR/assets/barbosa_scene.npz" ] || [ ! -f "$SCRIPT_DIR/assets/doradal_scene.npz" ]; then
-    echo "Procesando modelos de FreeCAD (Barbosa y Doradal)..."
+if [ ! -f "$SCRIPT_DIR/assets/tipo1_scene.npz" ] || [ ! -f "$SCRIPT_DIR/assets/tipo2_scene.npz" ]; then
+    echo "Procesando modelos de FreeCAD (Vivienda Tipo 1 y Tipo 2)..."
     python "$SCRIPT_DIR/extract_models.py"
 fi
 
